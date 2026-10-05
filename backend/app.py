@@ -4,6 +4,7 @@ import os
 import shutil
 import datetime
 import jwt
+import time
 from functools import wraps
 from flask import Flask, jsonify, request, send_from_directory, make_response
 import csv
@@ -12,6 +13,7 @@ from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 import cloudinary
 import cloudinary.uploader
+import cloudinary.api as cloudinary_api
 from werkzeug.utils import secure_filename
 import base64
 try:
@@ -19,53 +21,35 @@ try:
 except Exception:
     requests = None
 
-# Determine paths
+IS_SERVERLESS = bool(os.environ.get('VERCEL') or os.environ.get('AWS_LAMBDA_FUNCTION_NAME'))
+CLOUDINARY_DB_PUBLIC_ID = "pimut_pos/data/pos_db"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-if os.environ.get('VERCEL') or os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
-    # Use /tmp for writable database in serverless environments
-    DB_NAME = "/tmp/pos.db"
-    # Copy initial DB if it exists
-    original_db = os.path.join(BASE_DIR, "pos.db")
-    if os.path.exists(original_db) and not os.path.exists(DB_NAME):
-        try:
-            shutil.copy2(original_db, DB_NAME)
-        except Exception as e:
-            print(f"Warning: Could not copy initial database: {e}")
-else:
-    DB_NAME = os.environ.get('DB_PATH') or os.path.join(BASE_DIR, "pos.db")
-
 FRONTEND_DIR = os.path.join(BASE_DIR, '..')
 
-if os.environ.get('VERCEL') or os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
-    # In serverless, we can't write to the source directory.
-    # We use /tmp for temporary uploads or disable local storage.
+if IS_SERVERLESS:
+    DB_NAME = "/tmp/pos.db"
     PRODUCT_UPLOAD_DIR = os.path.join("/tmp", 'uploads', 'products')
     BRAND_UPLOAD_DIR = os.path.join("/tmp", 'uploads', 'branding')
 else:
+    DB_NAME = os.environ.get('DB_PATH') or os.path.join(BASE_DIR, "pos.db")
     PRODUCT_UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads', 'products')
     BRAND_UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads', 'branding')
+
+os.makedirs(PRODUCT_UPLOAD_DIR, exist_ok=True)
+os.makedirs(BRAND_UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__, static_url_path='', static_folder=FRONTEND_DIR)
 app.config['SECRET_KEY'] = 'your_secret_key_change_this_in_production'
 CORS(app)
 
-# Cloudinary configuration
 def configure_cloudinary():
-    # Priority 1: Environment variable (Vercel/Production)
     url = os.environ.get('CLOUDINARY_URL')
-    
-    # Priority 2: Hardcoded fallback (if no environment variable set)
     if not url:
         url = 'cloudinary://633288168755168:fWtJvHuIIVmRVDnz0PGoR7beeLc@diocrcpdl'
-    
     try:
-        # Explicitly parse the URL to ensure api_key and api_secret are set correctly
-        # Format: cloudinary://api_key:api_secret@cloud_name
         clean_url = url.replace('cloudinary://', '').strip()
         auth_part, cloud_name = clean_url.split('@')
         api_key, api_secret = auth_part.split(':')
-        
         cloudinary.config(
             cloud_name=cloud_name,
             api_key=api_key,
@@ -82,9 +66,75 @@ def configure_cloudinary():
 
 configure_cloudinary()
 
+def _cloudinary_db_url():
+    cfg = cloudinary.config()
+    try:
+        cloud_name = cfg.cloud_name
+        return f"https://res.cloudinary.com/{cloud_name}/raw/upload/{CLOUDINARY_DB_PUBLIC_ID}"
+    except Exception:
+        return None
+
+def restore_db_from_cloudinary(force=False):
+    if not IS_SERVERLESS:
+        return False
+    if os.path.exists(DB_NAME) and not force:
+        mtime = os.path.getmtime(DB_NAME)
+        if time.time() - mtime < 30:
+            return False
+    try:
+        url = _cloudinary_db_url()
+        if not url:
+            return False
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200 and len(r.content) > 1000:
+            tmp_path = DB_NAME + ".tmp"
+            with open(tmp_path, 'wb') as f:
+                f.write(r.content)
+            shutil.move(tmp_path, DB_NAME)
+            print(f"[DB] Restored from Cloudinary ({len(r.content)} bytes)")
+            return True
+    except Exception as e:
+        print(f"[DB] Cloudinary restore failed: {e}")
+    try:
+        original_db = os.path.join(BASE_DIR, "pos.db")
+        if os.path.exists(original_db):
+            shutil.copy2(original_db, DB_NAME)
+            print("[DB] Restored from bundled pos.db")
+            return True
+    except Exception as e:
+        print(f"[DB] Bundled restore failed: {e}")
+    return False
+
+def save_db_to_cloudinary():
+    if not IS_SERVERLESS:
+        return True
+    if not os.path.exists(DB_NAME):
+        return False
+    try:
+        with open(DB_NAME, 'rb') as f:
+            res = cloudinary.uploader.upload(
+                f,
+                public_id=CLOUDINARY_DB_PUBLIC_ID,
+                resource_type="raw",
+                overwrite=True,
+                invalidate=True
+            )
+        print(f"[DB] Saved to Cloudinary: {res.get('bytes', '?')} bytes")
+        return True
+    except Exception as e:
+        print(f"[DB] Cloudinary save failed: {e}")
+        return False
+
 def get_db_connection():
-    conn = sqlite3.connect(DB_NAME)
+    if IS_SERVERLESS:
+        try:
+            restore_db_from_cloudinary(force=False)
+        except Exception:
+            pass
+    conn = sqlite3.connect(DB_NAME, timeout=20)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 def init_db():
@@ -267,8 +317,25 @@ def init_db():
 # Initialize DB
 try:
     init_db()
+    if IS_SERVERLESS:
+        try:
+            save_db_to_cloudinary()
+        except Exception:
+            pass
 except Exception as e:
     print(f"CRITICAL ERROR during database initialization: {e}")
+
+def sync_db(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        result = f(*args, **kwargs)
+        if IS_SERVERLESS:
+            try:
+                save_db_to_cloudinary()
+            except Exception:
+                pass
+        return result
+    return decorated
 
 # --- Auth Helpers ---
 
@@ -432,6 +499,7 @@ def list_holds():
 @app.route('/api/holds', methods=['POST'])
 @token_required
 @role_required(['cashier', 'admin', 'assistant', 'super_admin'])
+@sync_db
 def create_hold():
     data = request.get_json() or {}
     items = data.get('items') or []
@@ -480,6 +548,7 @@ def get_hold(hold_id):
 @app.route('/api/holds/<int:hold_id>', methods=['DELETE'])
 @token_required
 @role_required(['cashier', 'admin', 'assistant', 'super_admin'])
+@sync_db
 def delete_hold(hold_id):
     conn = get_db_connection()
     try:
@@ -618,6 +687,7 @@ def list_banks():
 @app.route('/api/banks', methods=['POST'])
 @token_required
 @role_required_strict(['admin'])
+@sync_db
 def add_bank():
     data = request.get_json() or {}
     name = (data.get('name') or '').strip()
@@ -649,6 +719,7 @@ def list_categories():
 @app.route('/api/categories', methods=['POST'])
 @token_required
 @role_required(['admin'])
+@sync_db
 def add_category():
     data = request.get_json() or {}
     name = (data.get('name') or '').strip()
@@ -719,6 +790,7 @@ def get_products_for_pos():
 @app.route('/api/products', methods=['POST'])
 @token_required
 @role_required(['admin', 'assistant'])
+@sync_db
 def create_product():
     data = request.get_json() or {}
     name = (data.get('name') or '').strip()
@@ -773,6 +845,7 @@ def create_product():
 @app.route('/products/<int:product_id>/variants/', methods=['POST', 'OPTIONS'])
 @token_required
 @role_required(['admin', 'assistant', 'super_admin'])
+@sync_db
 def create_variants(product_id):
     # Handle preflight/OPTIONS quickly
     if request.method == 'OPTIONS':
@@ -832,6 +905,7 @@ def list_users():
 @app.route('/api/users', methods=['POST'])
 @token_required
 @role_required_strict(['admin'])
+@sync_db
 def create_user():
     data = request.get_json() or {}
     username = (data.get('username') or '').strip()
@@ -861,6 +935,7 @@ def create_user():
         conn.close()
 @app.route('/api/me/password', methods=['POST'])
 @token_required
+@sync_db
 def change_my_password():
     data = request.get_json() or {}
     old_pw = (data.get('old_password') or '').strip()
@@ -883,6 +958,7 @@ def change_my_password():
 @app.route('/api/users/<int:user_id>/password', methods=['PUT'])
 @token_required
 @role_required(['admin'])
+@sync_db
 def admin_set_password(user_id):
     data = request.get_json() or {}
     new_pw = (data.get('new_password') or '').strip()
@@ -905,6 +981,7 @@ def admin_set_password(user_id):
 @app.route('/api/products/<int:id>/image/upload', methods=['POST'])
 @token_required
 @role_required(['admin', 'assistant'])
+@sync_db
 def upload_product_image(id):
     file = request.files.get('file')
     if not file:
@@ -961,6 +1038,7 @@ def upload_product_image(id):
 @app.route('/api/branding/logo', methods=['POST'])
 @token_required
 @role_required(['admin'])
+@sync_db
 def upload_brand_logo():
     file = request.files.get('file')
     if not file:
@@ -1000,6 +1078,7 @@ def get_brand_logo():
 @app.route('/api/sales', methods=['POST']) # Alias for frontend compatibility
 @token_required
 @role_required(['cashier', 'admin', 'super_admin'])
+@sync_db
 def create_sale():
     data = request.get_json()
     items = data.get('items') # List of {productId, quantity, price}
@@ -1093,6 +1172,7 @@ def get_sale(sale_id):
 @app.route('/api/sales/<int:sale_id>/refund', methods=['POST'])
 @token_required
 @role_required(['admin'])
+@sync_db
 def refund_sale(sale_id):
     data = request.get_json() or {}
     reason = (data.get('reason') or '').strip()
@@ -1198,6 +1278,7 @@ def void_sale(sale_id):
 @app.route('/api/products/<int:id>/stock', methods=['PUT']) # Alias
 @token_required
 @role_required(['admin'])
+@sync_db
 def update_stock(id):
     data = request.get_json()
     new_stock = data.get('stock')
@@ -1218,6 +1299,7 @@ def update_stock(id):
 @app.route('/api/products/<int:id>/threshold', methods=['PUT'])
 @token_required
 @role_required(['admin'])
+@sync_db
 def update_low_stock_threshold(id):
     data = request.get_json() or {}
     thr = data.get('low_stock_threshold')
@@ -1239,6 +1321,7 @@ def update_low_stock_threshold(id):
 @app.route('/api/products/<int:id>/min_price', methods=['PUT'])
 @token_required
 @role_required(['admin'])
+@sync_db
 def update_min_price(id):
     data = request.get_json() or {}
     mp = data.get('min_price')

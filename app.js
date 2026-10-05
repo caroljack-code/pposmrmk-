@@ -223,40 +223,53 @@ async function apiCall(url, options = {}) {
         'Content-Type': 'application/json',
         ...options.headers
     };
-    
+
     if (authToken) {
         headers['Authorization'] = `Bearer ${authToken}`;
     }
-    
-    const fullUrl = url.startsWith('/api/') && API_BASE ? (API_BASE + url) : url;
-    let response;
-    try {
-        response = await fetch(fullUrl, { ...options, headers });
-    } catch (e) {
-        console.error(`Fetch failed for ${fullUrl}:`, e);
-        // If it was an absolute URL that failed, try the relative one as fallback
-        if (url.startsWith('/api/') && API_BASE) {
-            try {
-                response = await fetch(url, { ...options, headers });
-            } catch (e2) {
-                throw e; // Throw the original error
+
+    const isRead = !options.method || options.method === 'GET';
+    const maxRetries = isRead ? 3 : 1;
+    let lastErr = null;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        if (attempt > 0) {
+            await new Promise(r => setTimeout(r, 600 * attempt));
+        }
+        const fullUrl = url.startsWith('/api/') && API_BASE ? (API_BASE + url) : url;
+        let response;
+        try {
+            response = await fetch(fullUrl, { ...options, headers });
+        } catch (e) {
+            lastErr = e;
+            if (url.startsWith('/api/') && API_BASE) {
+                try {
+                    response = await fetch(url, { ...options, headers });
+                } catch (e2) {
+                    if (attempt < maxRetries - 1) continue;
+                    throw e;
+                }
+            } else {
+                if (attempt < maxRetries - 1) continue;
+                throw e;
             }
-        } else {
-            throw e;
         }
-    }
-    
-    if (response && response.status === 401) {
-        // Token expired or invalid
-        authToken = null;
-        localStorage.removeItem('pos_token');
-        loginModal.style.display = 'block';
-        if (!options.allow401) {
-            throw new Error('Unauthorized');
+
+        if (response && response.status === 401) {
+            authToken = null;
+            localStorage.removeItem('pos_token');
+            if (loginModal) loginModal.style.display = 'block';
+            if (!options.allow401) throw new Error('Unauthorized');
         }
+
+        if (response && [500, 502, 503, 504].includes(response.status) && attempt < maxRetries - 1) {
+            lastErr = new Error('HTTP ' + response.status);
+            continue;
+        }
+
+        return response;
     }
-    
-    return response;
+    throw lastErr || new Error('Request failed');
 }
 window.setApiBase = async function() {
     const current = API_BASE || '';
@@ -863,7 +876,26 @@ window.changeMyPassword = async function() {
 };
 // --- POS Functions ---
 
-// Fetch products from API
+function _cacheProducts(data) {
+    try {
+        localStorage.setItem('pos_cache_products', JSON.stringify({
+            ts: Date.now(),
+            data: data || []
+        }));
+    } catch (e) {}
+}
+function _restoreCachedProducts() {
+    try {
+        const raw = localStorage.getItem('pos_cache_products');
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || !Array.isArray(parsed.data)) return null;
+        return parsed.data;
+    } catch (e) {
+        return null;
+    }
+}
+
 async function fetchProducts() {
     try {
         let response;
@@ -871,29 +903,72 @@ async function fetchProducts() {
             response = await apiCall('/api/pos/products');
         } catch (e) {
             console.warn('Primary products fetch failed, trying fallback...', e);
-            response = await apiCall('/api/products');
+            try {
+                response = await apiCall('/api/products');
+            } catch (e2) {
+                const cached = _restoreCachedProducts();
+                if (cached && cached.length) {
+                    products = cached;
+                    renderProducts(products);
+                    if (productsListEl) {
+                        const warn = document.createElement('div');
+                        warn.style.cssText = 'margin:0.5rem 0;padding:0.5rem;background:#fff7ed;color:#9a3412;border:1px solid #fdba74;border-radius:8px;font-size:0.85rem;';
+                        warn.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i> Showing cached products. Server is warming up — refresh in a moment.';
+                        productsListEl.parentElement.insertBefore(warn, productsListEl);
+                        setTimeout(() => { try { warn.remove(); } catch {} }, 8000);
+                    }
+                    return;
+                }
+                throw e;
+            }
         }
 
         if (!response.ok) {
-            const result = await response.json().catch(() => ({}));
-            const msg = result.error || result.message || `HTTP ${response.status}`;
-            productsListEl.innerHTML = `<p class="error">Server Error: ${msg}</p>`;
+            const cached = _restoreCachedProducts();
+            if (cached && cached.length) {
+                products = cached;
+                renderProducts(products);
+            } else {
+                const result = await response.json().catch(() => ({}));
+                const msg = result.error || result.message || `HTTP ${response.status}`;
+                if (productsListEl) productsListEl.innerHTML = `<p class="error">Server Error: ${msg}</p>`;
+            }
             return;
         }
 
         const result = await response.json();
         if (result.message === 'success') {
             products = result.data;
+            _cacheProducts(products);
             renderProducts(products);
             if (userRole === 'admin') {
                 fetchLowStockAlerts();
             }
         } else {
-            productsListEl.innerHTML = `<p class="error">Failed to load products: ${result.message || 'Unknown error'}</p>`;
+            const cached = _restoreCachedProducts();
+            if (cached && cached.length) {
+                products = cached;
+                renderProducts(products);
+            } else {
+                if (productsListEl) productsListEl.innerHTML = `<p class="error">Failed to load products: ${result.message || 'Unknown error'}</p>`;
+            }
         }
     } catch (error) {
         console.error('Error fetching products:', error);
-        if (error.message !== 'Unauthorized') {
+        const cached = _restoreCachedProducts();
+        if (cached && cached.length) {
+            products = cached;
+            renderProducts(products);
+            if (productsListEl) {
+                const warn = document.createElement('div');
+                warn.style.cssText = 'margin:0.5rem 0;padding:0.5rem;background:#fff7ed;color:#9a3412;border:1px solid #fdba74;border-radius:8px;font-size:0.85rem;';
+                warn.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i> Offline: Showing cached products. Check your internet or server and refresh.';
+                productsListEl.parentElement.insertBefore(warn, productsListEl);
+                setTimeout(() => { try { warn.remove(); } catch {} }, 10000);
+            }
+            return;
+        }
+        if (error.message !== 'Unauthorized' && productsListEl) {
              productsListEl.innerHTML = `<p class="error">Connection Error: Could not connect to the server. Please ensure the backend is running at ${API_BASE || 'the same origin'}.</p>`;
         }
     }
