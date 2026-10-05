@@ -26,10 +26,15 @@ CLOUDINARY_DB_PUBLIC_ID = "pimut_pos/data/pos_db"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIR = os.path.join(BASE_DIR, '..')
 
+_TMPDIR = '/tmp' if (os.name == 'posix' and os.path.exists('/tmp')) else (
+    os.environ.get('TEMP') or os.environ.get('TMP') or BASE_DIR
+)
+_DB_VERSION_FILE = os.path.join(_TMPDIR, "_db_version.json") if IS_SERVERLESS else os.path.join(BASE_DIR, "_db_version.json")
+
 if IS_SERVERLESS:
-    DB_NAME = "/tmp/pos.db"
-    PRODUCT_UPLOAD_DIR = os.path.join("/tmp", 'uploads', 'products')
-    BRAND_UPLOAD_DIR = os.path.join("/tmp", 'uploads', 'branding')
+    DB_NAME = os.path.join(_TMPDIR, "pos.db")
+    PRODUCT_UPLOAD_DIR = os.path.join(_TMPDIR, 'uploads', 'products')
+    BRAND_UPLOAD_DIR = os.path.join(_TMPDIR, 'uploads', 'branding')
 else:
     DB_NAME = os.environ.get('DB_PATH') or os.path.join(BASE_DIR, "pos.db")
     PRODUCT_UPLOAD_DIR = os.path.join(BASE_DIR, 'uploads', 'products')
@@ -42,7 +47,10 @@ app = Flask(__name__, static_url_path='', static_folder=FRONTEND_DIR)
 app.config['SECRET_KEY'] = 'your_secret_key_change_this_in_production'
 CORS(app)
 
+_CLOUD_NAME = None
+
 def configure_cloudinary():
+    global _CLOUD_NAME
     url = os.environ.get('CLOUDINARY_URL')
     if not url:
         url = 'cloudinary://633288168755168:fWtJvHuIIVmRVDnz0PGoR7beeLc@diocrcpdl'
@@ -56,53 +64,109 @@ def configure_cloudinary():
             api_secret=api_secret,
             secure=True
         )
+        _CLOUD_NAME = cloud_name
         print(f"Cloudinary configured successfully for cloud: {cloud_name}")
     except Exception as e:
         print(f"Warning: Cloudinary explicit config failed: {e}. Trying generic config.")
         try:
             cloudinary.config(cloudinary_url=url, secure=True)
+            try:
+                _CLOUD_NAME = cloudinary.config().cloud_name
+            except Exception:
+                pass
         except Exception as e2:
             print(f"Error: Cloudinary total config failure: {e2}")
 
 configure_cloudinary()
 
-def _cloudinary_db_url():
-    cfg = cloudinary.config()
+def _read_local_version():
     try:
-        cloud_name = cfg.cloud_name
-        return f"https://res.cloudinary.com/{cloud_name}/raw/upload/{CLOUDINARY_DB_PUBLIC_ID}"
+        if os.path.exists(_DB_VERSION_FILE):
+            with open(_DB_VERSION_FILE, 'r') as f:
+                d = json.load(f) or {}
+                return int(d.get('ts') or 0)
     except Exception:
+        pass
+    return 0
+
+def _write_local_version(ts):
+    try:
+        with open(_DB_VERSION_FILE, 'w') as f:
+            json.dump({'ts': int(ts)}, f)
+    except Exception:
+        pass
+
+def _cloudinary_resource_info():
+    try:
+        r = cloudinary_api.resource(CLOUDINARY_DB_PUBLIC_ID, resource_type="raw")
+        if r and r.get('bytes', 0) > 0:
+            return {
+                'version': int(r.get('version') or 0),
+                'bytes': int(r.get('bytes') or 0),
+                'created_at': r.get('created_at')
+            }
+    except Exception as e:
+        if "404" in str(e) or "not found" in str(e).lower():
+            return None
+        print(f"[DB] Cloudinary resource_info failed: {e}")
+    return None
+
+def _cloudinary_db_url(version=None):
+    if not _CLOUD_NAME:
+        try:
+            _CLOUD_NAME = cloudinary.config().cloud_name
+        except Exception:
+            return None
+    if not _CLOUD_NAME:
         return None
+    if version:
+        return f"https://res.cloudinary.com/{_CLOUD_NAME}/raw/upload/v{version}/{CLOUDINARY_DB_PUBLIC_ID}?_={int(time.time()*1000)}"
+    return f"https://res.cloudinary.com/{_CLOUD_NAME}/raw/upload/{CLOUDINARY_DB_PUBLIC_ID}?_={int(time.time()*1000)}"
 
 def restore_db_from_cloudinary(force=False):
     if not IS_SERVERLESS:
         return False
-    if os.path.exists(DB_NAME) and not force:
-        mtime = os.path.getmtime(DB_NAME)
-        if time.time() - mtime < 30:
-            return False
     try:
-        url = _cloudinary_db_url()
-        if not url:
-            return False
-        r = requests.get(url, timeout=15)
-        if r.status_code == 200 and len(r.content) > 1000:
-            tmp_path = DB_NAME + ".tmp"
-            with open(tmp_path, 'wb') as f:
-                f.write(r.content)
-            shutil.move(tmp_path, DB_NAME)
-            print(f"[DB] Restored from Cloudinary ({len(r.content)} bytes)")
-            return True
+        info = _cloudinary_resource_info()
+        if not info:
+            print("[DB] Cloudinary: no remote DB found (first run? will seed)")
+        else:
+            remote_ts = info.get('version') or 0
+            local_ts = _read_local_version()
+            if remote_ts and not force and (remote_ts <= local_ts):
+                print(f"[DB] Cloudinary: local up-to-date (local={local_ts} remote={remote_ts})")
+                return False
+            url = _cloudinary_db_url(version=remote_ts if remote_ts else None)
+            if not url:
+                return False
+            r = requests.get(url, timeout=20)
+            if r.status_code == 200 and len(r.content) > 1000:
+                tmp_path = DB_NAME + ".tmp"
+                with open(tmp_path, 'wb') as f:
+                    f.write(r.content)
+                shutil.move(tmp_path, DB_NAME)
+                _write_local_version(remote_ts or int(time.time()))
+                print(f"[DB] Restored from Cloudinary v{remote_ts} ({len(r.content)} bytes)")
+                return True
     except Exception as e:
         print(f"[DB] Cloudinary restore failed: {e}")
+    local_version_exists = os.path.exists(_DB_VERSION_FILE)
+    local_db_exists = os.path.exists(DB_NAME)
     try:
         original_db = os.path.join(BASE_DIR, "pos.db")
         if os.path.exists(original_db):
-            shutil.copy2(original_db, DB_NAME)
-            print("[DB] Restored from bundled pos.db")
-            return True
+            if not local_db_exists and not local_version_exists:
+                shutil.copy2(original_db, DB_NAME)
+                print("[DB] Restored from bundled pos.db (first run only)")
+                return True
+            elif local_db_exists and local_version_exists:
+                print("[DB] Keeping existing local DB (Cloudinary unreachable)")
+            elif local_db_exists:
+                print("[DB] Keeping existing local DB (no version file but DB present)")
     except Exception as e:
         print(f"[DB] Bundled restore failed: {e}")
+    if not os.path.exists(DB_NAME):
+        print("[DB] No remote, no bundled. Will init fresh.")
     return False
 
 def save_db_to_cloudinary():
@@ -117,24 +181,54 @@ def save_db_to_cloudinary():
                 public_id=CLOUDINARY_DB_PUBLIC_ID,
                 resource_type="raw",
                 overwrite=True,
-                invalidate=True
+                invalidate=False,
+                unique_filename=False
             )
-        print(f"[DB] Saved to Cloudinary: {res.get('bytes', '?')} bytes")
+        new_version = int(res.get('version') or time.time())
+        _write_local_version(new_version)
+        print(f"[DB] Saved to Cloudinary: v{new_version} ({res.get('bytes', '?')} bytes)")
         return True
     except Exception as e:
         print(f"[DB] Cloudinary save failed: {e}")
         return False
 
+_request_restored = set()
+
+def _ensure_db_for_request():
+    if not IS_SERVERLESS:
+        return
+    rid = request.environ.get('werkzeug.request_id') or id(request)
+    if rid in _request_restored:
+        return
+    _request_restored.add(rid)
+    try:
+        restore_db_from_cloudinary(force=False)
+    except Exception:
+        pass
+
+@app.before_request
+def _before_req_db_sync():
+    _request_restored.clear()
+    if IS_SERVERLESS:
+        try:
+            _ensure_db_for_request()
+        except Exception:
+            pass
+
 def get_db_connection():
     if IS_SERVERLESS:
         try:
-            restore_db_from_cloudinary(force=False)
+            _ensure_db_for_request()
         except Exception:
             pass
-    conn = sqlite3.connect(DB_NAME, timeout=20)
+    conn = sqlite3.connect(DB_NAME, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        pass
     return conn
 
 def init_db():
@@ -319,7 +413,9 @@ try:
     init_db()
     if IS_SERVERLESS:
         try:
-            save_db_to_cloudinary()
+            info = _cloudinary_resource_info()
+            if info is None and os.path.exists(DB_NAME):
+                save_db_to_cloudinary()
         except Exception:
             pass
 except Exception as e:
@@ -332,8 +428,8 @@ def sync_db(f):
         if IS_SERVERLESS:
             try:
                 save_db_to_cloudinary()
-            except Exception:
-                pass
+            except Exception as ex:
+                print(f"[DB] sync_db error in {getattr(f, '__name__', '?')}: {ex}")
         return result
     return decorated
 
@@ -394,6 +490,71 @@ def role_required_strict(allowed_roles):
     return decorator
 
 # --- Routes ---
+
+@app.route('/api/db/sync', methods=['POST'])
+@token_required
+@role_required_strict(['admin'])
+def manual_db_sync():
+    action = (request.get_json(silent=True) or {}).get('action') or 'save'
+    data = {
+        'is_serverless': IS_SERVERLESS,
+        'db_exists': os.path.exists(DB_NAME),
+        'db_size': os.path.getsize(DB_NAME) if os.path.exists(DB_NAME) else 0,
+        'local_version': _read_local_version(),
+    }
+    try:
+        info = _cloudinary_resource_info()
+        data['remote'] = info
+    except Exception as e:
+        data['remote_error'] = str(e)
+    try:
+        if action == 'restore':
+            data['restore_result'] = restore_db_from_cloudinary(force=True)
+        else:
+            if not os.path.exists(DB_NAME):
+                init_db()
+            data['save_result'] = save_db_to_cloudinary()
+    except Exception as e:
+        data['action_error'] = str(e)
+    try:
+        data['local_version_after'] = _read_local_version()
+    except Exception:
+        pass
+    return jsonify({"message": "success", "data": data})
+
+@app.route('/api/db/info', methods=['GET'])
+@token_required
+@role_required_strict(['admin'])
+def db_info():
+    data = {
+        'is_serverless': IS_SERVERLESS,
+        'db_path': DB_NAME,
+        'db_exists': os.path.exists(DB_NAME),
+        'db_size': os.path.getsize(DB_NAME) if os.path.exists(DB_NAME) else 0,
+        'local_version': _read_local_version(),
+        'cloudinary_url': _cloudinary_db_url(),
+        'cloud_public_id': CLOUDINARY_DB_PUBLIC_ID,
+        'cloud_name': _CLOUD_NAME,
+    }
+    try:
+        data['remote'] = _cloudinary_resource_info()
+    except Exception as e:
+        data['remote_error'] = str(e)
+    if os.path.exists(DB_NAME):
+        try:
+            conn = get_db_connection()
+            counts = {}
+            for t in ['users', 'products', 'sales', 'sale_items', 'categories', 'banks', 'holds']:
+                try:
+                    c = conn.execute(f'SELECT COUNT(*) AS n FROM {t}').fetchone()
+                    counts[t] = int(c['n'])
+                except Exception:
+                    counts[t] = None
+            conn.close()
+            data['row_counts'] = counts
+        except Exception as ex:
+            data['counts_error'] = str(ex)
+    return jsonify({"message": "success", "data": data})
 
 # Login Route
 @app.route('/uploads/<path:filename>')
